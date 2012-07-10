@@ -1,3 +1,5 @@
+require "thin"
+
 module Thin
   module Preforker
     autoload :Controller, "thin/preforker/controller"
