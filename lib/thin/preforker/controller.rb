@@ -173,6 +173,8 @@ module Thin
           $stderr.reopen(log_fp)
           $stdin.reopen("/dev/null")
           
+          $0 = server.name
+          
           Dir.chdir(@pwd)
           
           server.send(:write_pid_file)
@@ -199,7 +201,7 @@ module Thin
           FileUtils.mkdir_p File.dirname(@options[:preforker_pid])
           FileUtils.mkdir_p File.dirname(@options[:preforker_log])
                     
-          Daemonize.daemonize
+          Daemonize.daemonize @options[:preforker_log], "thin-preforker"
           
           Dir.chdir(pwd)
           
