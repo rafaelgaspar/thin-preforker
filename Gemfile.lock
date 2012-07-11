@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    thin-preforker (0.0.2)
+    thin-preforker (0.0.3)
 
 GEM
   remote: https://rubygems.org/
