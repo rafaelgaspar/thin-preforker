@@ -1,59 +1,58 @@
 module Thin
   module Preforker
     class Controller < Thin::Controllers::Cluster
-      def initialize *args
-        super
+      def initialize options
+        @options = options
         
-        GC.copy_on_write_friendly = true if GC.respond_to?(:copy_on_write_friendly=)  
+        if @options[:socket]
+          @options.delete(:address)
+          @options.delete(:port)
+        end
+        
+        GC.copy_on_write_friendly = true if GC.respond_to?(:copy_on_write_friendly=) 
       end
       
       # Start the servers
       def start
+        daemonize_prefoker if @options[:daemonize]
+                        
         with_each_server do |n|
           start_server n, app
-          sleep 0.1 # Let the OS breath
         end
+        
+        Process.waitall
       end
       
       # Start a single server
       def start_server(number, app)
         log "Starting server on #{server_id(number)} ... "
         
-        # Save the log files
-        logs = logs_to_reopen
+        server = Thin::Server.new(server_options_for(number)[:socket] || server_options_for(number)[:address],
+                            server_options_for(number)[:port],
+                            server_options_for(number))
+          
+        # Set options
+        server.pid_file                       = server_options_for(number)[:pid]
+        server.log_file                       = server_options_for(number)[:log]
+        server.timeout                        = server_options_for(number)[:timeout]
+        server.maximum_connections            = server_options_for(number)[:max_conns]
+        server.maximum_persistent_connections = server_options_for(number)[:max_persistent_conns]
+        server.threaded                       = server_options_for(number)[:threaded]
+        server.no_epoll                       = server_options_for(number)[:no_epoll] if server.backend.respond_to?(:no_epoll=)
+          
+        # ssl support
+        if server_options_for(number)[:ssl]
+          server.ssl = true
+          server.ssl_options = { :private_key_file => server_options_for(number)[:ssl_key_file], :cert_chain_file => server_options_for(number)[:ssl_cert_file], :verify_peer => server_options_for(number)[:ssl_verify] }
+        end
         
-        # Force GC to collect before forking
-        GC.start
-                        
-        fork do
-          $stdout.reopen($stdout)
-          $stderr.reopen($stderr)
-          $stdin.reopen("/dev/null")
+        before_fork_for(server, number)
+                      
+        Process.fork do
+          after_fork_for(server, number)
           
           # Constantize backend class
           server_options_for(number)[:backend] = eval(server_options_for(number)[:backend], TOPLEVEL_BINDING) if server_options_for(number)[:backend]
-          
-          server = Thin::Server.new(server_options_for(number)[:socket] || server_options_for(number)[:address], # Server detects kind of socket
-                              server_options_for(number)[:port],                         # Port ignored on UNIX socket
-                              server_options_for(number))
-          
-          # Set options
-          server.pid_file                       = server_options_for(number)[:pid]
-          server.log_file                       = server_options_for(number)[:log]
-          server.timeout                        = server_options_for(number)[:timeout]
-          server.maximum_connections            = server_options_for(number)[:max_conns]
-          server.maximum_persistent_connections = server_options_for(number)[:max_persistent_conns]
-          server.threaded                       = server_options_for(number)[:threaded]
-          server.no_epoll                       = server_options_for(number)[:no_epoll] if server.backend.respond_to?(:no_epoll=)
-          
-          # ssl support
-          if server_options_for(number)[:ssl]
-            server.ssl = true
-            server.ssl_options = { :private_key_file => server_options_for(number)[:ssl_key_file], :cert_chain_file => server_options_for(number)[:ssl_cert_file], :verify_peer => server_options_for(number)[:ssl_verify] }
-          end
-          
-          # Detach the process, after this line the current process returns
-          server.daemonize if server_options_for(number)[:daemonize]
           
           # +config+ must be called before changing privileges since it might require superuser power.
           server.config
@@ -68,11 +67,11 @@ module Thin
           
           # If a stats URL is specified, wrap in Stats adapter
           server.app = Thin::Stats::Adapter.new(server.app, server_options_for(number)[:stats]) if server_options_for(number)[:stats]
-          
-          reopen_logs logs
 
           server.start
         end
+        
+        wait_for_file :creation, server_options_for(number)[:pid]
       end
       
       # Stop the servers
@@ -97,13 +96,15 @@ module Thin
       
       # Stop and start the servers.
       def restart
-        app
+        daemonize_prefoker if @options[:daemonize]
         
         with_each_server do |n|
           stop_server n
           start_server n, app
           sleep 0.1 # Let the OS breath
         end
+        
+        Process.waitall
       end
       
       private
@@ -112,6 +113,10 @@ module Thin
           # a Rack adapter from it. Or else we guess which adapter to use and load it.
           @app ||= @options[:rackup] ? load_rackup_config : load_adapter
         end
+        
+        def callbacks
+          @callbacks ||= Callbacks.new @options[:callbacks]
+        end
       
         def server_options_for(number)
           @server_options ||= {}
@@ -119,7 +124,7 @@ module Thin
           
           # Sets the server options for this server
           @server_options[number] = @options.reject { |option, value| CLUSTER_OPTIONS.include?(option) }
-          @server_options[number].merge!(:pid => pid_file_for(number), :log => log_file_for(number))
+          @server_options[number].merge!(:pid => pid_file_for(number), :log => log_file_for(number), :daemonize => nil)
           if socket
             @server_options[number].merge!(:socket => socket_for(number))
           elsif swiftiply?
@@ -135,7 +140,7 @@ module Thin
           require 'fcntl'
           
           logs = []
-          ObjectSpace.each_object(File) { |fp| logs << fp.path if fp.fcntl(Fcntl::F_GETFL) == File::APPEND | File::WRONLY rescue false }
+          
           
           logs
         end
@@ -143,6 +148,67 @@ module Thin
         def reopen_logs logs
           ObjectSpace.each_object(File) { |fp| fp.reopen(fp.path, "a") if logs.include? fp.path }
         end
+        
+        def before_fork_for(server, number)
+          raise ArgumentError, "You must specify a pid file to fork" unless server_options_for(number)[:pid]
+          raise ArgumentError, "You must specify a log file to fork" unless server_options_for(number)[:log]
+          
+          server.send(:remove_stale_pid_file)
+          
+          @pwd = Dir.pwd # Current directory is changed during fork, so store it
+          
+          FileUtils.mkdir_p File.dirname(server_options_for(number)[:pid])
+          FileUtils.mkdir_p File.dirname(server_options_for(number)[:log])
+          
+          @logs = []
+          ObjectSpace.each_object(File) { |fp| @logs << fp.path if fp.fcntl(Fcntl::F_GETFL) == File::APPEND | File::WRONLY rescue false }
+        
+          callbacks.run_before_fork_callbacks server, number
+        end
+      
+        def after_fork_for(server, number)
+          log_fp = open(server_options_for(number)[:log], "a")
+          log_fp.sync = true
+          $stdout.reopen(log_fp)
+          $stderr.reopen(log_fp)
+          $stdin.reopen("/dev/null")
+          
+          Dir.chdir(@pwd)
+          
+          server.send(:write_pid_file)
+          server.send(:at_exit) do
+            log ">> Exiting!"
+            server.send(:remove_pid_file)
+          end
+          
+          Signal.trap("INT") { server.stop! }
+          Signal.trap("TERM") { server.stop }
+          Signal.trap("QUIT") { server.stop } unless Thin.win?
+          
+          ObjectSpace.each_object(File) { |fp| fp.reopen(fp.path, "a") if @logs.include? fp.path }
+          
+          callbacks.run_after_fork_callbacks server, number
+        end
+        
+        def daemonize_prefoker
+          raise ArgumentError, "You must specify a preforker pid file to daemonize" unless @options[:preforker_pid]
+          raise ArgumentError, "You must specify a preforker log file to daemonize" unless @options[:preforker_log]
+          
+          pwd = Dir.pwd # Current directory is changed during fork, so store it
+          
+          FileUtils.mkdir_p File.dirname(@options[:preforker_pid])
+          FileUtils.mkdir_p File.dirname(@options[:preforker_log])
+                    
+          Daemonize.daemonize
+          
+          Dir.chdir(pwd)
+          
+          Daemonize.redirect_io @options[:preforker_log]
+          
+          log ">> Writing PID to #{@options[:preforker_pid]}"
+          open(@options[:preforker_pid],"w") { |f| f.write(Process.pid) }
+          File.chmod(0644, @options[:preforker_pid])
+        end          
     end
   end
 end
